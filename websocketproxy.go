@@ -25,9 +25,17 @@ var (
 	DefaultDialer = websocket.DefaultDialer
 )
 
+var defaultRewriter = func(msg []byte) ([]byte, bool) {
+	return msg, false
+}
+
 // WebsocketProxy is an HTTP Handler that takes an incoming WebSocket
 // connection and proxies it to another server.
 type WebsocketProxy struct {
+	// Rewriter, if non-nil, will be called on every incoming message
+	// so proxy can do something on it.
+	Rewriter func([]byte) (msg []byte, skip bool)
+
 	// Director, if non-nil, is a function that may copy additional request
 	// headers from the incoming WebSocket connection into the output headers
 	// which will be forwarded to another server.
@@ -62,7 +70,7 @@ func NewProxy(target *url.URL) *WebsocketProxy {
 		u.RawQuery = r.URL.RawQuery
 		return &u
 	}
-	return &WebsocketProxy{Backend: backend}
+	return &WebsocketProxy{Backend: backend, Rewriter: defaultRewriter}
 }
 
 // ServeHTTP implements the http.Handler that proxies WebSocket connections.
@@ -191,7 +199,13 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				dst.WriteMessage(websocket.CloseMessage, m)
 				break
 			}
-			err = dst.WriteMessage(msgType, msg)
+
+			rewritted, skip := w.Rewriter(msg)
+			if skip {
+				continue
+			}
+
+			err = dst.WriteMessage(msgType, rewritted)
 			if err != nil {
 				errc <- err
 				break
