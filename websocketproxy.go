@@ -25,16 +25,36 @@ var (
 	DefaultDialer = websocket.DefaultDialer
 )
 
-var defaultRewriter = func(msg []byte) ([]byte, bool) {
-	return msg, false
+type globalLogger struct{}
+
+func (l *globalLogger) Infof(format string, v ...interface{}) {
+	log.Printf(format, v...)
+}
+
+func (l *globalLogger) Errorf(format string, v ...interface{}) {
+	log.Printf(format, v...)
+}
+
+// Interface to pass external logger
+type Logger interface {
+	Infof(format string, v ...interface{})
+	Errorf(format string, v ...interface{})
+}
+
+type Rewriter interface {
+	Handle(msg []byte) ([]byte, bool)
 }
 
 // WebsocketProxy is an HTTP Handler that takes an incoming WebSocket
 // connection and proxies it to another server.
 type WebsocketProxy struct {
-	// Rewriter, if non-nil, will be called on every incoming message
-	// so proxy can do something on it.
-	Rewriter func([]byte) (msg []byte, skip bool)
+	// IncomingRewriter, if non-nil, will be called on every message
+	// from backend to client
+	IncomingRewriter Rewriter
+
+	// OutgoingRewriter, if non-nil, will be called on every message
+	// from client to backend
+	OutgoingRewriter Rewriter
 
 	// Director, if non-nil, is a function that may copy additional request
 	// headers from the incoming WebSocket connection into the output headers
@@ -53,6 +73,9 @@ type WebsocketProxy struct {
 	//  Dialer contains options for connecting to the backend WebSocket server.
 	//  If nil, DefaultDialer is used.
 	Dialer *websocket.Dialer
+
+	// External logger
+	Logger Logger
 }
 
 // ProxyHandler returns a new http.Handler interface that reverse proxies the
@@ -70,20 +93,20 @@ func NewProxy(target *url.URL) *WebsocketProxy {
 		u.RawQuery = r.URL.RawQuery
 		return &u
 	}
-	return &WebsocketProxy{Backend: backend, Rewriter: defaultRewriter}
+	return &WebsocketProxy{Backend: backend, Logger: &globalLogger{}}
 }
 
 // ServeHTTP implements the http.Handler that proxies WebSocket connections.
 func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	if w.Backend == nil {
-		log.Println("websocketproxy: backend function is not defined")
+		w.Logger.Errorf("websocketproxy: backend function is not defined\n")
 		http.Error(rw, "internal server error (code: 1)", http.StatusInternalServerError)
 		return
 	}
 
 	backendURL := w.Backend(req)
 	if backendURL == nil {
-		log.Println("websocketproxy: backend URL is nil")
+		w.Logger.Errorf("websocketproxy: backend URL is nil\n")
 		http.Error(rw, "internal server error (code: 2)", http.StatusInternalServerError)
 		return
 	}
@@ -145,13 +168,13 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// http://tools.ietf.org/html/draft-ietf-hybi-websocket-multiplexing-01
 	connBackend, resp, err := dialer.Dial(backendURL.String(), requestHeader)
 	if err != nil {
-		log.Printf("websocketproxy: couldn't dial to remote backend url %s", err)
+		w.Logger.Errorf("websocketproxy: couldn't dial to remote backend url %s", err)
 		if resp != nil {
 			// If the WebSocket handshake fails, ErrBadHandshake is returned
 			// along with a non-nil *http.Response so that callers can handle
 			// redirects, authentication, etcetera.
 			if err := copyResponse(rw, resp); err != nil {
-				log.Printf("websocketproxy: couldn't write response after failed remote backend handshake: %s", err)
+				w.Logger.Errorf("websocketproxy: couldn't write response after failed remote backend handshake: %s", err)
 			}
 		} else {
 			http.Error(rw, http.StatusText(http.StatusServiceUnavailable), http.StatusServiceUnavailable)
@@ -178,14 +201,14 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 	// Also pass the header that we gathered from the Dial handshake.
 	connPub, err := upgrader.Upgrade(rw, req, upgradeHeader)
 	if err != nil {
-		log.Printf("websocketproxy: couldn't upgrade %s", err)
+		w.Logger.Errorf("websocketproxy: couldn't upgrade %s", err)
 		return
 	}
 	defer connPub.Close()
 
 	errClient := make(chan error, 1)
 	errBackend := make(chan error, 1)
-	replicateWebsocketConn := func(dst, src *websocket.Conn, errc chan error) {
+	replicateWebsocketConn := func(dst, src *websocket.Conn, rewriter Rewriter, errc chan error) {
 		for {
 			msgType, msg, err := src.ReadMessage()
 			if err != nil {
@@ -200,12 +223,15 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 				break
 			}
 
-			rewritted, skip := w.Rewriter(msg)
-			if skip {
-				continue
+			skip := false
+			if rewriter != nil {
+				msg, skip = rewriter.Handle(msg)
+				if skip {
+					continue
+				}
 			}
 
-			err = dst.WriteMessage(msgType, rewritted)
+			err = dst.WriteMessage(msgType, msg)
 			if err != nil {
 				errc <- err
 				break
@@ -213,8 +239,8 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 		}
 	}
 
-	go replicateWebsocketConn(connPub, connBackend, errClient)
-	go replicateWebsocketConn(connBackend, connPub, errBackend)
+	go replicateWebsocketConn(connPub, connBackend, w.IncomingRewriter, errClient)
+	go replicateWebsocketConn(connBackend, connPub, w.OutgoingRewriter, errBackend)
 
 	var message string
 	select {
@@ -225,7 +251,7 @@ func (w *WebsocketProxy) ServeHTTP(rw http.ResponseWriter, req *http.Request) {
 
 	}
 	if e, ok := err.(*websocket.CloseError); !ok || e.Code == websocket.CloseAbnormalClosure {
-		log.Printf(message, err)
+		w.Logger.Errorf(message, err)
 	}
 }
 

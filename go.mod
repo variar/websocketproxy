@@ -1,4 +1,4 @@
-module github.com/tommsawyer/websocketproxy
+module github.com/variar/websocketproxy
 
 go 1.14
 
